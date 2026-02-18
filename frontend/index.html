@@ -540,8 +540,8 @@
           setTimeout(() => {
             window.location.href =
               data.user.role === "hr" || data.user.role === "admin"
-                ? "hr.html"
-                : "employee.html";
+                ? "/hr-manager"
+                : "/employee";
           }, 500);
         } catch (e) {
           showAlert("authError", e.message);
@@ -596,7 +596,22 @@
         }
       });
 
-      if (localStorage.getItem("token")) window.location.href = "employee.html";
+      if (localStorage.getItem("token")) {
+        fetch(API + "/auth/me", {
+          headers: { Authorization: "Bearer " + localStorage.getItem("token") },
+        })
+          .then((res) => res.json())
+          .then((user) => {
+            if (user.role === "hr" || user.role === "admin") {
+              window.location.href = "/hr-manager";
+            } else {
+              window.location.href = "/employee";
+            }
+          })
+          .catch(() => {
+            localStorage.removeItem("token");
+          });
+      }
     </script>
   </body>
 </html>

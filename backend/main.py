@@ -6,7 +6,7 @@ import dotenv
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 from datetime import datetime, timedelta, date, timezone
@@ -605,16 +605,25 @@ async def export_excel(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BASE_DIR.parent / "frontend"
 
-# ══════════════════════════════════════════════════════════
-# HEALTH
-# ══════════════════════════════════════════════════════════
+# Optional pretty routes
+@app.get("/login")
+async def login_page():
+    return FileResponse(FRONTEND_DIR / "index.html")
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "app": "Attendance System"}
+@app.get("/employee")
+async def employee_portal():
+    return FileResponse(FRONTEND_DIR / "employee.html")
 
+@app.get("/hr-manager")
+async def hr_manager_portal():
+    return FileResponse(FRONTEND_DIR / "hr.html")
 
 @app.get("/health")
 async def health():
@@ -626,6 +635,10 @@ async def health():
         "timezone": OFFICE_TIMEZONE,
     }
 
+
+app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

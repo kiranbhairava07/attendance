@@ -1281,7 +1281,7 @@
       /* ── Auth ── */
       async function checkAuth() {
         if (!token) {
-          window.location.href = "index.html";
+          window.location.href = "/login";
           return false;
         }
         try {
@@ -1289,7 +1289,7 @@
           return true;
         } catch (e) {
           localStorage.removeItem("token");
-          window.location.href = "index.html";
+          window.location.href = "/login";
           return false;
         }
       }
@@ -1297,7 +1297,7 @@
       function logout() {
         localStorage.removeItem("token");
         if (locationWatcher) navigator.geolocation.clearWatch(locationWatcher);
-        window.location.href = "index.html";
+        window.location.href = "/login";
       }
 
       /* ── Clock ── */
@@ -1318,7 +1318,7 @@
           const ok = await checkAuth();
           if (!ok) return;
           if (user.role === "hr" || user.role === "admin") {
-            window.location.href = "hr.html";
+            window.location.href = "/hr-manager";
             return;
           }
 
