@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>GeoPunch · Login</title>
+    <title>GodavariKrishna · Login</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -356,7 +356,7 @@
             <circle cx="12" cy="10" r="3" />
           </svg>
         </div>
-        <span class="brand-name">GeoPunch</span>
+        <span class="brand-name">GodavariKrishna</span>
       </div>
 
       <!-- Card -->
@@ -447,22 +447,6 @@
             </svg>
           </button>
         </div>
-
-        <!-- Demo Credentials -->
-        <div class="demo-box">
-          <div class="demo-label">Demo Credentials</div>
-          <div class="demo-row">
-            <div class="demo-creds">
-              <strong>john.smith@company.com</strong> · password123
-            </div>
-            <span class="demo-role">Employee</span>
-          </div>
-          <div class="demo-row">
-            <div class="demo-creds">
-              <strong>hr@company.com</strong> · hrpass123
-            </div>
-            <span class="demo-role hr">HR</span>
-          </div>
         </div>
       </div>
     </div>
@@ -470,7 +454,7 @@
     <div class="toast" id="toast"></div>
 
     <script>
-      const API = "https://hr-attendance-yt7b.onrender.com/api";
+      const API = "/api";
       let token = localStorage.getItem("token");
 
       function toast(msg, type = "success") {
@@ -602,15 +586,12 @@
         })
           .then((res) => res.json())
           .then((user) => {
-            if (user.role === "hr" || user.role === "admin") {
-              window.location.href = "/hr-manager";
-            } else {
-              window.location.href = "/employee";
+            if (user && user.role) {
+              window.location.href =
+                user.role === "hr" || user.role === "admin" ? "/hr-manager" : "/employee";
             }
           })
-          .catch(() => {
-            localStorage.removeItem("token");
-          });
+          .catch(() => localStorage.removeItem("token"));
       }
     </script>
   </body>

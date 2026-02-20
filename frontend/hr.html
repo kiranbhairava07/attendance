@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>GeoPunch · HR Reports</title>
+    <title>GodavariKrishna · HR Reports</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -799,7 +799,7 @@
               <circle cx="12" cy="10" r="3" />
             </svg>
           </div>
-          <span class="brand-name">GeoPunch</span>
+          <span class="brand-name">GodavariKrishna</span>
         </a>
         <div class="search-wrap">
           <svg
@@ -1045,7 +1045,7 @@
     <div class="toast" id="toast"></div>
 
     <script>
-      const API = "https://hr-attendance-yt7b.onrender.com/api";
+      const API = "/api";
       let token = localStorage.getItem("token");
       let user = null;
       let currentFilter = "all";
@@ -1317,7 +1317,8 @@
           document.getElementById("totalHours").textContent = Math.round(
             totalMins / 60,
           ).toLocaleString();
-          document.getElementById("hoursChange").textContent = "+12.4%";
+          // hoursChange left blank — requires historical data comparison
+          document.getElementById("hoursChange").textContent = "";
           document.getElementById("activeStaff").textContent = present;
           document.getElementById("staffFraction").textContent =
             `${present} / ${total}`;

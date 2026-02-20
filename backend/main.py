@@ -1,90 +1,172 @@
 """
 Attendance System — FastAPI Backend
-Fixed & production-ready
+Production-ready internal app
 """
-import dotenv
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, EmailStr
-from typing import Optional
-from datetime import datetime, timedelta, date, timezone
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 import asyncpg
+import math
 import os
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+import pytz
+
+from datetime import datetime, timedelta, date
 from io import BytesIO
+from typing import Optional, Annotated
+
+import dotenv
+from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from jose import JWTError, jwt
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-import math
-import pytz
-#import dotenv
-dotenv.load_dotenv()  # Load .env file if present
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, field_validator
+from pydantic_settings import BaseSettings
 
-# ─── Config ───────────────────────────────────────────────
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/attendance_db"
+dotenv.load_dotenv()
+
+# ─── Logging ──────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "8"))
+logger = logging.getLogger("attendance")
 
-# Office timezone — all shift comparisons done in local time
-# Override via env var if needed: e.g. "America/New_York"
-OFFICE_TIMEZONE = os.getenv("OFFICE_TIMEZONE", "Asia/Kolkata")
 
-# ─── App ──────────────────────────────────────────────────
-app = FastAPI(title="Attendance System")
+# ─── Settings ─────────────────────────────────────────────
+class Settings(BaseSettings):
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/attendance_db"
+    secret_key: str = ""
+    algorithm: str = "HS256"
+    access_token_expire_hours: int = 8
+    office_timezone: str = "Asia/Kolkata"
+    # Comma-separated allowed origins; empty = same-origin only
+    cors_origins: str = ""
+    # Grace period (minutes) before marking late
+    late_grace_minutes: int = 0
+    db_pool_min: int = 5
+    db_pool_max: int = 20
+
+    model_config = {"env_file": ".env", "case_sensitive": False}
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        if not self.cors_origins:
+            return []
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+
+settings = Settings()
+
+if not settings.secret_key:
+    raise RuntimeError(
+        "SECRET_KEY env var is required and must not be empty. "
+        "Set it in your .env file or environment."
+    )
+
+
+# ─── App (lifespan) ───────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool
+    logger.info("Connecting to database…")
+    db_pool = await asyncpg.create_pool(
+        settings.database_url,
+        min_size=settings.db_pool_min,
+        max_size=settings.db_pool_max,
+    )
+    logger.info("Database pool ready.")
+    yield
+    if db_pool:
+        await db_pool.close()
+        logger.info("Database pool closed.")
+
+
+app = FastAPI(
+    title="Attendance System",
+    docs_url=None,       # Disable Swagger in production; enable if needed
+    redoc_url=None,
+    lifespan=lifespan,
+)
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS — restrict to configured origins only (empty = no CORS headers)
+if settings.allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 # ─── Database ─────────────────────────────────────────────
 db_pool: Optional[asyncpg.Pool] = None
 
 
-@app.on_event("startup")
-async def startup():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=20)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    if db_pool:
-        await db_pool.close()
-
-
 async def get_db():
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not available")
     async with db_pool.acquire() as conn:
         yield conn
 
 
-# ─── Models ───────────────────────────────────────────────
+# ─── Pydantic Models ──────────────────────────────────────
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Password must not be empty")
+        return v
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_length(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
 
 
 class PunchRequest(BaseModel):
     latitude: float
     longitude: float
 
+    @field_validator("latitude")
+    @classmethod
+    def valid_latitude(cls, v: float) -> float:
+        if not (-90 <= v <= 90):
+            raise ValueError("Latitude must be between -90 and 90")
+        return v
+
+    @field_validator("longitude")
+    @classmethod
+    def valid_longitude(cls, v: float) -> float:
+        if not (-180 <= v <= 180):
+            raise ValueError("Longitude must be between -180 and 180")
+        return v
+
 
 # ─── Helpers ──────────────────────────────────────────────
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371000
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
+    """Return distance in metres between two GPS coordinates."""
+    R = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
@@ -100,36 +182,64 @@ def hash_password(password: str) -> str:
 
 
 def create_token(user_id: int, email: str, role: str) -> str:
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    expire = datetime.now(tz=pytz.utc) + timedelta(hours=settings.access_token_expire_hours)
     return jwt.encode(
         {"sub": str(user_id), "email": email, "role": role, "exp": expire},
-        SECRET_KEY,
-        algorithm=ALGORITHM,
+        settings.secret_key,
+        algorithm=settings.algorithm,
     )
 
 
 def get_local_now() -> datetime:
-    """Return current datetime in office timezone (aware)."""
-    tz = pytz.timezone(OFFICE_TIMEZONE)
-    return datetime.now(tz)
+    """Current datetime in office timezone (aware)."""
+    return datetime.now(pytz.timezone(settings.office_timezone))
 
 
-def utc_to_local(dt: datetime) -> datetime:
+def utc_to_local(dt: Optional[datetime]) -> Optional[datetime]:
     """Convert a UTC-aware or naive datetime to office local time."""
     if dt is None:
         return None
-    tz = pytz.timezone(OFFICE_TIMEZONE)
+    tz = pytz.timezone(settings.office_timezone)
     if dt.tzinfo is None:
         dt = pytz.utc.localize(dt)
     return dt.astimezone(tz)
 
 
+def parse_date_param(date_str: Optional[str], param_name: str = "date_str") -> date:
+    """Parse a YYYY-MM-DD string; raise 400 on bad format."""
+    if not date_str:
+        return date.today()
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {param_name} format. Expected YYYY-MM-DD.",
+        )
+
+
+def serialize_employee_row(e: dict) -> dict:
+    """Convert DB row fields to JSON-safe types."""
+    if e.get("first_punch_in"):
+        e["first_punch_in"] = utc_to_local(e["first_punch_in"]).isoformat()
+    if e.get("last_punch_out"):
+        e["last_punch_out"] = utc_to_local(e["last_punch_out"]).isoformat()
+    if e.get("shift_start"):
+        e["shift_start"] = e["shift_start"].strftime("%H:%M")
+    if e.get("shift_end"):
+        e["shift_end"] = e["shift_end"].strftime("%H:%M")
+    return e
+
+
+# ─── Auth Dependency ──────────────────────────────────────
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: asyncpg.Connection = Depends(get_db),
-):
+) -> dict:
     try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            credentials.credentials, settings.secret_key, algorithms=[settings.algorithm]
+        )
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -140,8 +250,8 @@ async def get_current_user(
     user = await db.fetchrow(
         """SELECT u.id, u.email, u.full_name, u.role, u.branch_id,
                   u.shift_start, u.shift_end,
-                  b.name as branch_name, b.city as branch_city,
-                  b.latitude as branch_lat, b.longitude as branch_lng,
+                  b.name  AS branch_name,  b.city    AS branch_city,
+                  b.latitude  AS branch_lat, b.longitude AS branch_lng,
                   b.radius_meters
            FROM users u
            LEFT JOIN branches b ON u.branch_id = b.id
@@ -150,14 +260,14 @@ async def get_current_user(
     )
 
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="User not found or deactivated")
 
     return dict(user)
 
 
-async def require_hr(user: dict = Depends(get_current_user)):
-    if user["role"] not in ["hr", "admin"]:
-        raise HTTPException(status_code=403, detail="HR access required")
+async def require_hr(user: dict = Depends(get_current_user)) -> dict:
+    if user["role"] not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="HR/Admin access required")
     return user
 
 
@@ -165,27 +275,35 @@ async def require_hr(user: dict = Depends(get_current_user)):
 # AUTH ROUTES
 # ══════════════════════════════════════════════════════════
 
-@app.post("/api/auth/register")
-async def register(req: LoginRequest, db: asyncpg.Connection = Depends(get_db)):
+@app.post("/api/auth/register", status_code=201)
+async def register(req: RegisterRequest, db: asyncpg.Connection = Depends(get_db)):
+    """
+    Self-registration endpoint.
+    In a fully locked-down internal deployment, disable this and provision
+    users via an admin panel or direct DB seeding.
+    """
     existing = await db.fetchrow("SELECT id FROM users WHERE email = $1", req.email.lower())
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
+    full_name = req.email.split("@")[0].replace(".", " ").replace("_", " ").title()
     user = await db.fetchrow(
         """INSERT INTO users (email, password_hash, full_name, role, is_active)
            VALUES ($1, $2, $3, 'employee', TRUE)
            RETURNING id, email, full_name, role""",
         req.email.lower(),
         hash_password(req.password),
-        req.email.split("@")[0].replace(".", " ").title(),
+        full_name,
     )
+    logger.info("New user registered: %s", req.email)
     return dict(user)
 
 
 @app.post("/api/auth/login")
 async def login(req: LoginRequest, db: asyncpg.Connection = Depends(get_db)):
     user = await db.fetchrow(
-        "SELECT id, email, password_hash, full_name, role, is_active FROM users WHERE email = $1",
+        """SELECT id, email, password_hash, full_name, role, is_active
+           FROM users WHERE email = $1""",
         req.email.lower(),
     )
 
@@ -193,9 +311,10 @@ async def login(req: LoginRequest, db: asyncpg.Connection = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not user["is_active"]:
-        raise HTTPException(status_code=403, detail="Account deactivated")
+        raise HTTPException(status_code=403, detail="Account deactivated. Contact HR.")
 
     await db.execute("UPDATE users SET last_login = NOW() WHERE id = $1", user["id"])
+    logger.info("Login: user_id=%s email=%s role=%s", user["id"], user["email"], user["role"])
 
     token = create_token(user["id"], user["email"], user["role"])
     return {
@@ -212,18 +331,17 @@ async def login(req: LoginRequest, db: asyncpg.Connection = Depends(get_db)):
 
 @app.post("/api/auth/logout")
 async def logout():
+    # Stateless JWT — client discards token. Extend with a token denylist if needed.
     return {"message": "Logged out successfully"}
 
 
 @app.get("/api/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
-    # Serialize time fields to HH:MM strings for the frontend
     result = dict(user)
     if result.get("shift_start"):
         result["shift_start"] = result["shift_start"].strftime("%H:%M")
     if result.get("shift_end"):
         result["shift_end"] = result["shift_end"].strftime("%H:%M")
-    # Serialize decimal coords to float
     for field in ("branch_lat", "branch_lng"):
         if result.get(field) is not None:
             result[field] = float(result[field])
@@ -233,6 +351,18 @@ async def get_me(user: dict = Depends(get_current_user)):
 # ══════════════════════════════════════════════════════════
 # ATTENDANCE ROUTES
 # ══════════════════════════════════════════════════════════
+
+async def _get_today_punch_types(db: asyncpg.Connection, user_id: int) -> list[str]:
+    """Fetch punch types for the current local day, ordered chronologically."""
+    rows = await db.fetch(
+        """SELECT punch_type FROM attendance_logs
+           WHERE user_id = $1
+             AND (punched_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
+           ORDER BY punched_at ASC""",
+        user_id, settings.office_timezone,
+    )
+    return [r["punch_type"] for r in rows]
+
 
 @app.post("/api/attendance/punch-in")
 async def punch_in(
@@ -246,46 +376,43 @@ async def punch_in(
     # ── Geofence check ──────────────────────────────────────
     distance = haversine(
         req.latitude, req.longitude,
-        float(user["branch_lat"]), float(user["branch_lng"])
+        float(user["branch_lat"]), float(user["branch_lng"]),
     )
     radius = user["radius_meters"] or 200
     if distance > radius:
         raise HTTPException(
             status_code=403,
-            detail=f"You are {int(distance)}m from office. Must be within {radius}m to punch in."
+            detail=f"You are {int(distance)}m from office. Must be within {radius}m to punch in.",
         )
 
-    # ── One punch-in per day — block if complete cycle exists ──
-    today_logs = await db.fetch(
-        """SELECT punch_type FROM attendance_logs
-           WHERE user_id = $1 AND (punched_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
-           ORDER BY punched_at ASC""",
-        user["id"], OFFICE_TIMEZONE
-    )
+    # ── Prevent duplicate punch-in ───────────────────────────
+    punch_types = await _get_today_punch_types(db, user["id"])
 
-    punch_types = [r["punch_type"] for r in today_logs]
-
-    # Already has an 'in' without 'out' → already punched in
     if punch_types and punch_types[-1] == "in":
         raise HTTPException(status_code=409, detail="Already punched in. Please punch out first.")
 
-    # Completed a full in→out cycle → cannot punch in again today
     if "in" in punch_types and "out" in punch_types:
         raise HTTPException(
             status_code=409,
-            detail="You have already completed your attendance for today. See you tomorrow!"
+            detail="Attendance already completed for today. See you tomorrow!",
         )
 
-    # ── Calculate late status using LOCAL time ───────────────
+    # ── Late calculation (with configurable grace period) ────
     local_now = get_local_now()
     punch_time_local = local_now.time()
-    shift_start = user["shift_start"]  # already a time object from DB
+    shift_start = user["shift_start"]  # datetime.time from DB
 
-    is_late = punch_time_local > shift_start
+    is_late = False
     late_minutes = 0
-    if is_late:
-        delta = datetime.combine(date.today(), punch_time_local) - datetime.combine(date.today(), shift_start)
-        late_minutes = max(0, int(delta.total_seconds() / 60))
+    if shift_start:
+        delta_seconds = (
+            datetime.combine(date.today(), punch_time_local)
+            - datetime.combine(date.today(), shift_start)
+        ).total_seconds()
+        grace_seconds = settings.late_grace_minutes * 60
+        if delta_seconds > grace_seconds:
+            is_late = True
+            late_minutes = max(0, int((delta_seconds - grace_seconds) / 60))
 
     async with db.transaction():
         log = await db.fetchrow(
@@ -294,26 +421,28 @@ async def punch_in(
                VALUES ($1, $2, 'in', $3, $4, $5, TRUE)
                RETURNING id, punched_at""",
             user["id"], user["branch_id"],
-            req.latitude, req.longitude, int(distance)
+            req.latitude, req.longitude, int(distance),
         )
 
-        # Insert/update daily summary — status is 'present' (late is tracked separately)
         await db.execute(
             """INSERT INTO daily_summary
                (user_id, work_date, first_punch_in, is_late, late_by_minutes, status)
                VALUES ($1, (NOW() AT TIME ZONE $2)::date, $3, $4, $5, 'present')
                ON CONFLICT (user_id, work_date) DO UPDATE SET
-                 first_punch_in   = EXCLUDED.first_punch_in,
-                 is_late          = EXCLUDED.is_late,
-                 late_by_minutes  = EXCLUDED.late_by_minutes,
-                 status           = 'present'""",
-            user["id"], OFFICE_TIMEZONE, log["punched_at"], is_late, late_minutes
+                 first_punch_in  = EXCLUDED.first_punch_in,
+                 is_late         = EXCLUDED.is_late,
+                 late_by_minutes = EXCLUDED.late_by_minutes,
+                 status          = 'present'""",
+            user["id"], settings.office_timezone, log["punched_at"], is_late, late_minutes,
         )
 
     local_punch = utc_to_local(log["punched_at"])
+    late_msg = f" — late by {late_minutes} min" if is_late else ""
+    logger.info("Punch-in: user_id=%s dist=%dm late=%s", user["id"], int(distance), is_late)
+
     return {
         "success": True,
-        "message": "Punched in successfully" + (" — but you're late by " + str(late_minutes) + " min" if is_late else ""),
+        "message": f"Punched in successfully{late_msg}",
         "time": local_punch.strftime("%I:%M %p"),
         "distance": int(distance),
         "is_late": is_late,
@@ -330,33 +459,18 @@ async def punch_out(
     if not user["branch_id"]:
         raise HTTPException(status_code=400, detail="No branch assigned. Contact HR.")
 
-    # ── Punch-out: record GPS but do NOT enforce geofence ────
-    # (employee may leave and then realize they forgot to punch out)
-    distance = 0
+    # Record GPS distance (no geofence enforced on punch-out)
+    distance = 0.0
     if user["branch_lat"] and user["branch_lng"]:
         distance = haversine(
             req.latitude, req.longitude,
-            float(user["branch_lat"]), float(user["branch_lng"])
+            float(user["branch_lat"]), float(user["branch_lng"]),
         )
 
-    # ── Must have punched in today ───────────────────────────
-    today_logs = await db.fetch(
-        """SELECT punch_type FROM attendance_logs
-           WHERE user_id = $1 AND (punched_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
-           ORDER BY punched_at ASC""",
-        user["id"], OFFICE_TIMEZONE
-    )
-    punch_types = [r["punch_type"] for r in today_logs]
+    punch_types = await _get_today_punch_types(db, user["id"])
 
     if not punch_types or punch_types[-1] != "in":
         raise HTTPException(status_code=409, detail="Must punch in before punching out.")
-
-    # Already completed cycle — shouldn't reach here normally
-    if punch_types.count("out") >= 1:
-        raise HTTPException(
-            status_code=409,
-            detail="You have already punched out today."
-        )
 
     async with db.transaction():
         log = await db.fetchrow(
@@ -365,13 +479,13 @@ async def punch_out(
                VALUES ($1, $2, 'out', $3, $4, $5, TRUE)
                RETURNING id, punched_at""",
             user["id"], user["branch_id"],
-            req.latitude, req.longitude, int(distance)
+            req.latitude, req.longitude, int(distance),
         )
 
-        # Calculate total work minutes from first_punch_in
         summary = await db.fetchrow(
-            "SELECT first_punch_in FROM daily_summary WHERE user_id = $1 AND work_date = (NOW() AT TIME ZONE $2)::date",
-            user["id"], OFFICE_TIMEZONE
+            """SELECT first_punch_in FROM daily_summary
+               WHERE user_id = $1 AND work_date = (NOW() AT TIME ZONE $2)::date""",
+            user["id"], settings.office_timezone,
         )
 
         total_minutes = 0
@@ -383,42 +497,43 @@ async def punch_out(
             """UPDATE daily_summary
                SET last_punch_out = $2, total_minutes = $3
                WHERE user_id = $1 AND work_date = (NOW() AT TIME ZONE $4)::date""",
-            user["id"], log["punched_at"], total_minutes, OFFICE_TIMEZONE
+            user["id"], log["punched_at"], total_minutes, settings.office_timezone,
         )
 
     local_punch = utc_to_local(log["punched_at"])
+    hours_str = f"{total_minutes // 60}h {total_minutes % 60}m"
+    logger.info("Punch-out: user_id=%s total_minutes=%d", user["id"], total_minutes)
+
     return {
         "success": True,
         "message": "Punched out successfully. Have a great day!",
         "time": local_punch.strftime("%I:%M %p"),
-        "total_hours": f"{total_minutes // 60}h {total_minutes % 60}m",
+        "total_hours": hours_str,
     }
 
 
 @app.get("/api/attendance/status")
 async def get_status(
     user: dict = Depends(get_current_user),
-    db: asyncpg.Connection = Depends(get_db)
+    db: asyncpg.Connection = Depends(get_db),
 ):
     today_logs = await db.fetch(
         """SELECT punch_type, punched_at FROM attendance_logs
-           WHERE user_id = $1 AND (punched_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
+           WHERE user_id = $1
+             AND (punched_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
            ORDER BY punched_at ASC""",
-        user["id"], OFFICE_TIMEZONE
+        user["id"], settings.office_timezone,
     )
 
     summary = await db.fetchrow(
-        "SELECT * FROM daily_summary WHERE user_id = $1 AND work_date = (NOW() AT TIME ZONE $2)::date",
-        user["id"], OFFICE_TIMEZONE
+        """SELECT * FROM daily_summary
+           WHERE user_id = $1 AND work_date = (NOW() AT TIME ZONE $2)::date""",
+        user["id"], settings.office_timezone,
     )
 
     punch_types = [r["punch_type"] for r in today_logs]
     last = today_logs[-1] if today_logs else None
 
-    # Determine state:
-    # - "none"      → no punches yet today
-    # - "punched_in"  → last punch is 'in'
-    # - "completed"   → full in→out cycle done
     state = "none"
     if punch_types:
         if punch_types[-1] == "in":
@@ -429,7 +544,6 @@ async def get_status(
     summary_dict = None
     if summary:
         s = dict(summary)
-        # Convert timestamps to local time strings for frontend
         if s.get("first_punch_in"):
             s["first_punch_in"] = utc_to_local(s["first_punch_in"]).strftime("%I:%M %p")
         if s.get("last_punch_out"):
@@ -438,8 +552,11 @@ async def get_status(
 
     return {
         "is_punched_in": state == "punched_in",
-        "state": state,          # "none" | "punched_in" | "completed"
-        "last_punch": {"punch_type": last["punch_type"], "punched_at": str(last["punched_at"])} if last else None,
+        "state": state,
+        "last_punch": (
+            {"punch_type": last["punch_type"], "punched_at": str(last["punched_at"])}
+            if last else None
+        ),
         "summary": summary_dict,
     }
 
@@ -447,14 +564,15 @@ async def get_status(
 @app.get("/api/attendance/today")
 async def get_today_logs(
     user: dict = Depends(get_current_user),
-    db: asyncpg.Connection = Depends(get_db)
+    db: asyncpg.Connection = Depends(get_db),
 ):
     logs = await db.fetch(
         """SELECT punch_type, punched_at, distance_meters
            FROM attendance_logs
-           WHERE user_id = $1 AND (punched_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
+           WHERE user_id = $1
+             AND (punched_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
            ORDER BY punched_at ASC""",
-        user["id"], OFFICE_TIMEZONE
+        user["id"], settings.office_timezone,
     )
     result = []
     for log in logs:
@@ -468,47 +586,51 @@ async def get_today_logs(
 # HR ROUTES
 # ══════════════════════════════════════════════════════════
 
+@app.get("/api/hr/branches")
+async def get_branches(
+    user: dict = Depends(get_current_user),   # any authenticated user (employee needs it too)
+    db: asyncpg.Connection = Depends(get_db),
+):
+    branches = await db.fetch(
+        """SELECT id, name, city, address, latitude, longitude, radius_meters
+           FROM branches WHERE is_active = TRUE ORDER BY city, name"""
+    )
+    return [
+        {**dict(b), "latitude": float(b["latitude"]), "longitude": float(b["longitude"])}
+        for b in branches
+    ]
+
+
 @app.get("/api/hr/daily-report")
 async def daily_report(
-    date_str: str = None,
-    branch_id: int = None,
+    date_str: Annotated[Optional[str], Query()] = None,
+    branch_id: Annotated[Optional[int], Query()] = None,
     user: dict = Depends(require_hr),
     db: asyncpg.Connection = Depends(get_db),
 ):
-    target_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else date.today()
+    target_date = parse_date_param(date_str)
 
     query = """
         SELECT
             u.id, u.email, u.full_name, u.shift_start, u.shift_end,
-            b.name as branch_name, b.city,
+            b.name AS branch_name, b.city,
             s.first_punch_in, s.last_punch_out, s.total_minutes,
-            s.is_late, s.late_by_minutes, COALESCE(s.status, 'absent') as status
+            s.is_late, s.late_by_minutes, COALESCE(s.status, 'absent') AS status
         FROM users u
         LEFT JOIN branches b ON u.branch_id = b.id
         LEFT JOIN daily_summary s ON s.user_id = u.id AND s.work_date = $1
         WHERE u.is_active = TRUE AND u.role = 'employee'
     """
-    params = [target_date]
+    params: list = [target_date]
 
     if branch_id:
         query += " AND u.branch_id = $2"
         params.append(branch_id)
 
-    query += " ORDER BY b.name, u.full_name"
+    query += " ORDER BY b.name NULLS LAST, u.full_name"
     rows = await db.fetch(query, *params)
 
-    employees = []
-    for row in rows:
-        e = dict(row)
-        if e.get("first_punch_in"):
-            e["first_punch_in"] = utc_to_local(e["first_punch_in"]).isoformat()
-        if e.get("last_punch_out"):
-            e["last_punch_out"] = utc_to_local(e["last_punch_out"]).isoformat()
-        if e.get("shift_start"):
-            e["shift_start"] = e["shift_start"].strftime("%H:%M")
-        if e.get("shift_end"):
-            e["shift_end"] = e["shift_end"].strftime("%H:%M")
-        employees.append(e)
+    employees = [serialize_employee_row(dict(row)) for row in rows]
 
     stats = {
         "total": len(employees),
@@ -520,43 +642,29 @@ async def daily_report(
     return {"date": target_date.isoformat(), "stats": stats, "employees": employees}
 
 
-@app.get("/api/hr/branches")
-async def get_branches(db: asyncpg.Connection = Depends(get_db)):
-    branches = await db.fetch(
-        "SELECT id, name, city, address, latitude, longitude, radius_meters FROM branches WHERE is_active = TRUE ORDER BY city, name"
-    )
-    result = []
-    for b in branches:
-        d = dict(b)
-        d["latitude"] = float(d["latitude"])
-        d["longitude"] = float(d["longitude"])
-        result.append(d)
-    return result
-
-
 @app.get("/api/hr/export")
 async def export_excel(
-    date_str: str,
-    branch_id: int = None,
+    date_str: Annotated[str, Query()],
+    branch_id: Annotated[Optional[int], Query()] = None,
     user: dict = Depends(require_hr),
     db: asyncpg.Connection = Depends(get_db),
 ):
-    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    target_date = parse_date_param(date_str)
 
     query = """
-        SELECT u.email, u.full_name, b.name as branch_name, b.city,
+        SELECT u.email, u.full_name, b.name AS branch_name, b.city,
                s.first_punch_in, s.last_punch_out, s.total_minutes,
-               s.is_late, s.late_by_minutes, COALESCE(s.status, 'absent') as status
+               s.is_late, s.late_by_minutes, COALESCE(s.status, 'absent') AS status
         FROM users u
         LEFT JOIN branches b ON u.branch_id = b.id
         LEFT JOIN daily_summary s ON s.user_id = u.id AND s.work_date = $1
         WHERE u.is_active = TRUE AND u.role = 'employee'
     """
-    params = [target_date]
+    params: list = [target_date]
     if branch_id:
         query += " AND u.branch_id = $2"
         params.append(branch_id)
-    query += " ORDER BY b.name, u.full_name"
+    query += " ORDER BY b.name NULLS LAST, u.full_name"
 
     rows = await db.fetch(query, *params)
 
@@ -565,54 +673,74 @@ async def export_excel(
     ws.title = "Attendance"
 
     headers = ["Email", "Name", "Branch", "City", "Punch In", "Punch Out", "Hours", "Status", "Late By"]
+    header_fill = PatternFill(start_color="3B63F6", end_color="3B63F6", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    center = Alignment(horizontal="center")
+
     for col, header in enumerate(headers, 1):
         cell = ws.cell(1, col, header)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="3B63F6", end_color="3B63F6", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center")
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
 
     for row_idx, row in enumerate(rows, 2):
         status = row["status"]
         fill_color = "ECFDF5" if status == "present" else "FEF2F2"
+        row_fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
 
         pin = utc_to_local(row["first_punch_in"]).strftime("%I:%M %p") if row["first_punch_in"] else "—"
         pout = utc_to_local(row["last_punch_out"]).strftime("%I:%M %p") if row["last_punch_out"] else "—"
-        hours = f"{row['total_minutes'] // 60}h {row['total_minutes'] % 60}m" if row["total_minutes"] else "—"
+        mins = row["total_minutes"] or 0
+        hours = f"{mins // 60}h {mins % 60}m" if mins else "—"
+        late_label = f"+{row['late_by_minutes']}m" if row["is_late"] else "On Time"
+        status_label = ("LATE — " if row["is_late"] else "") + status.upper()
 
-        ws.cell(row_idx, 1, row["email"])
-        ws.cell(row_idx, 2, row["full_name"])
-        ws.cell(row_idx, 3, row["branch_name"] or "—")
-        ws.cell(row_idx, 4, row["city"] or "—")
-        ws.cell(row_idx, 5, pin)
-        ws.cell(row_idx, 6, pout)
-        ws.cell(row_idx, 7, hours)
-        ws.cell(row_idx, 8, ("LATE — " if row["is_late"] else "") + status.upper())
-        ws.cell(row_idx, 9, f"+{row['late_by_minutes']}m" if row["is_late"] else "On Time")
+        values = [
+            row["email"], row["full_name"],
+            row["branch_name"] or "—", row["city"] or "—",
+            pin, pout, hours, status_label, late_label,
+        ]
+        for col, val in enumerate(values, 1):
+            cell = ws.cell(row_idx, col, val)
+            cell.fill = row_fill
 
-        for col in range(1, 10):
-            ws.cell(row_idx, col).fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-
-    for col, width in zip("ABCDEFGHI", [26, 22, 26, 16, 12, 12, 10, 14, 10]):
-        ws.column_dimensions[col].width = width
+    for col_letter, width in zip("ABCDEFGHI", [26, 22, 26, 16, 12, 12, 10, 14, 10]):
+        ws.column_dimensions[col_letter].width = width
 
     output = BytesIO()
     wb.save(output)
     output.seek(0)
 
     filename = f"attendance_{target_date.isoformat()}.xlsx"
+    # RFC 5987-safe filename
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
     )
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pathlib import Path
 
+
+# ─── Health ───────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    tz = pytz.timezone(settings.office_timezone)
+    db_ok = db_pool is not None and not db_pool._closed
+    return {
+        "status": "healthy" if db_ok else "degraded",
+        "utc": datetime.now(pytz.utc).isoformat(),
+        "local": datetime.now(tz).isoformat(),
+        "timezone": settings.office_timezone,
+    }
+
+
+# ─── Frontend Static Files ────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
+# Original layout: main.py lives in backend/, frontend/ is a sibling folder at root
+# i.e.  project/
+#           backend/main.py
+#           frontend/index.html  employee.html  hr.html
 FRONTEND_DIR = BASE_DIR.parent / "frontend"
 
-# Optional pretty routes
 @app.get("/login")
 async def login_page():
     return FileResponse(FRONTEND_DIR / "index.html")
@@ -625,20 +753,16 @@ async def employee_portal():
 async def hr_manager_portal():
     return FileResponse(FRONTEND_DIR / "hr.html")
 
-@app.get("/health")
-async def health():
-    tz = pytz.timezone(OFFICE_TIMEZONE)
-    return {
-        "status": "healthy",
-        "utc": datetime.utcnow().isoformat(),
-        "local": datetime.now(tz).isoformat(),
-        "timezone": OFFICE_TIMEZONE,
-    }
-
-
+# Catch-all static mount — must come last, after all /api and page routes
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        log_level="info",
+    )
